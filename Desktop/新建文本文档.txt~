@@ -1,0 +1,263 @@
+函数重新实现：
+
+ 实现思路： 调用timer_sleep的时候直接把线程阻塞掉，然后给线程结构体加一个成员ticks_blocked来记录这个线程被sleep了多少时间， 然后利用操作系统自身的时钟中断（每个tick会执行一次）加入对线程状态的检测， 每次检测将ticks_blocked减1, 如果减到0就唤醒这个线程。
+
+具体代码：
+
+复制代码
+ 1 /* Sleeps for approximately TICKS timer ticks.  Interrupts must
+ 2    be turned on. */
+ 3 void
+ 4 timer_sleep (int64_t ticks)
+ 5 {
+ 6   if (ticks <= 0)
+ 7   {
+ 8     return;
+ 9   }
+10   ASSERT (intr_get_level () == INTR_ON);
+11   enum intr_level old_level = intr_disable ();
+12   struct thread *current_thread = thread_current ();
+13   current_thread->ticks_blocked = ticks;
+14   thread_block ();
+15   intr_set_level (old_level);
+16 }
+复制代码
+注意这里调用的thread_block：
+
+复制代码
+ 1 /* Puts the current thread to sleep.  It will not be scheduled
+ 2    again until awoken by thread_unblock().
+ 3 
+ 4    This function must be called with interrupts turned off.  It
+ 5    is usually a better idea to use one of the synchronization
+ 6    primitives in synch.h. */
+ 7 void
+ 8 thread_block (void)
+ 9 {
+10   ASSERT (!intr_context ());
+11   ASSERT (intr_get_level () == INTR_OFF);
+12 
+13   thread_current ()->status = THREAD_BLOCKED;
+14   schedule ();
+15 }
+复制代码
+线程的各种原理之前分析都已经剖析过了， 不作过多解释。
+
+给线程的结构体加上我们的ticks_blocked成员：
+
+1     /* Record the time the thread has been blocked. */
+2     int64_t ticks_blocked;
+然后在线程被创建的时候初始化ticks_blocked为0， 加在thread_create函数内：
+
+1   t->ticks_blocked = 0;
+然后修改时钟中断处理函数， 加入线程sleep时间的检测， 加在timer_interrupt内：
+
+1   thread_foreach (blocked_thread_check, NULL);
+这里的thread_foreach就是对每个线程都执行blocked_thread_check这个函数：
+
+复制代码
+ 1 /* Invoke function 'func' on all threads, passing along 'aux'.
+ 2    This function must be called with interrupts off. */
+ 3 void
+ 4 thread_foreach (thread_action_func *func, void *aux)
+ 5 {
+ 6   struct list_elem *e;
+ 7 
+ 8   ASSERT (intr_get_level () == INTR_OFF);
+ 9 
+10   for (e = list_begin (&all_list); e != list_end (&all_list);
+11        e = list_next (e))
+12     {
+13       struct thread *t = list_entry (e, struct thread, allelem);
+14       func (t, aux);
+15     }
+16 }
+复制代码
+aux就是传给这个函数的参数。
+
+然后， 给thread添加一个方法blocked_thread_check即可：
+
+thread.h中声明：
+
+1 void blocked_thread_check (struct thread *t, void *aux UNUSED);
+thread.c：
+
+复制代码
+ 1 /* Check the blocked thread */
+ 2 void
+ 3 blocked_thread_check (struct thread *t, void *aux UNUSED)
+ 4 {
+ 5   if (t->status == THREAD_BLOCKED && t->ticks_blocked > 0)
+ 6   {
+ 7       t->ticks_blocked--;
+ 8       if (t->ticks_blocked == 0)
+ 9       {
+10           thread_unblock(t);
+11       }
+12   }
+13 }
+复制代码
+thread_unblock就是把线程丢到就绪队列里继续跑：
+
+复制代码
+ 1 /* Transitions a blocked thread T to the ready-to-run state.
+ 2    This is an error if T is not blocked.  (Use thread_yield() to
+ 3    make the running thread ready.)
+ 4 
+ 5    This function does not preempt the running thread.  This can
+ 6    be important: if the caller had disabled interrupts itself,
+ 7    it may expect that it can atomically unblock a thread and
+ 8    update other data. */
+ 9 void
+10 thread_unblock (struct thread *t)
+11 {
+12   enum intr_level old_level;
+13 
+14   ASSERT (is_thread (t));
+15 
+16   old_level = intr_disable ();
+17   ASSERT (t->status == THREAD_BLOCKED);
+18   list_push_back (&ready_list, &t->elem);
+19   t->status = THREAD_READY;
+20   intr_set_level (old_level);
+21 }
+复制代码
+好的， 这样timer_sleep函数唤醒机制就实现了。
+
+然后跑测试结果会是这样的：
+
+ 
+
+好， 我们还需要pass掉alarm_priority我们这个实验一就算完成了，继续搞~
+
+ 
+
+Mission2:
+
+实现优先级调度（2.2.3）
+
+ 先来分析一下线程， 线程成员本身就有一个priority。
+
+复制代码
+ 1 struct thread
+ 2   {
+ 3     /* Owned by thread.c. */
+ 4     tid_t tid;                          /* Thread identifier. */
+ 5     enum thread_status status;          /* Thread state. */
+ 6     char name[16];                      /* Name (for debugging purposes). */
+ 7     uint8_t *stack;                     /* Saved stack pointer. */
+ 8     int priority;                       /* Priority. */
+ 9     struct list_elem allelem;           /* List element for all threads list. */
+10 
+11     /* Shared between thread.c and synch.c. */
+12     struct list_elem elem;              /* List element. */
+13 
+14 #ifdef USERPROG
+15     /* Owned by userprog/process.c. */
+16     uint32_t *pagedir;                  /* Page directory. */
+17 #endif
+18 
+19     /* Owned by thread.c. */
+20     unsigned magic;                     /* Detects stack overflow. */
+21 
+22     /* Record the time the thread has been blocked. */
+23     int64_t ticks_blocked;
+24   };
+复制代码
+然后priority的约束：
+
+1 /* Thread priorities. */
+2 #define PRI_MIN 0                       /* Lowest priority. */
+3 #define PRI_DEFAULT 31                  /* Default priority. */
+4 #define PRI_MAX 63                      /* Highest priority. */
+我们之前分析timer_sleep的时候其实已经对线程的调度有了非常深刻的剖析了，这里实现优先级调度的核心思想就是： 维持就绪队列为一个优先级队列。
+
+换一种说法： 我们在插入线程到就绪队列的时候保证这个队列是一个优先级队列即可。
+
+那么我们在什么时候会把一个线程丢到就绪队列中呢？
+
+1. thread_unblock
+
+2. init_thread
+
+3. thread_yield
+
+那么我们只要在扔的时候维持这个就绪队列是优先级队列即可。
+
+我们来看： thread_unblock现在丢进队列里是这么干的：
+
+1   list_push_back (&ready_list, &t->elem);
+这个是直接扔到队列尾部了， 我们并不希望这么做， 于是我们只要改一下这个扔的动作就可以了，因为调度的时候下一个thread是直接取队头的。
+
+那么我们先来研究一下pintos的队列是如何搞的，在/lib/kernel/：
+
+复制代码
+ 1 /* List element. */
+ 2 struct list_elem 
+ 3   {
+ 4     struct list_elem *prev;     /* Previous list element. */
+ 5     struct list_elem *next;     /* Next list element. */
+ 6   };
+ 7 
+ 8 /* List. */
+ 9 struct list 
+10   {
+11     struct list_elem head;      /* List head. */
+12     struct list_elem tail;      /* List tail. */
+13   };
+复制代码
+很常见的队列数据结构， 继续研究一下现在队列有哪些有用的函数可以帮助我们实现优先级队列：
+
+然后喜大普奔地发现了一些神奇的函数：
+
+复制代码
+1 /* Operations on lists with ordered elements. */
+2 void list_sort (struct list *,
+3                 list_less_func *, void *aux);
+4 void list_insert_ordered (struct list *, struct list_elem *,
+5                           list_less_func *, void *aux);
+6 void list_unique (struct list *, struct list *duplicates,
+7                   list_less_func *, void *aux);
+复制代码
+list_insert_ordered不就是为我们这里的实现量身订造的么！搞起！！
+
+复制代码
+ 1 /* Inserts ELEM in the proper position in LIST, which must be
+ 2    sorted according to LESS given auxiliary data AUX.
+ 3    Runs in O(n) average case in the number of elements in LIST. */
+ 4 void
+ 5 list_insert_ordered (struct list *list, struct list_elem *elem,
+ 6                      list_less_func *less, void *aux)
+ 7 {
+ 8   struct list_elem *e;
+ 9 
+10   ASSERT (list != NULL);
+11   ASSERT (elem != NULL);
+12   ASSERT (less != NULL);
+13 
+14   for (e = list_begin (list); e != list_end (list); e = list_next (e))
+15     if (less (elem, e, aux))
+16       break;
+17   return list_insert (e, elem);
+18 }
+复制代码
+直接修改thread_unblock函数把list_push_back改成：
+
+1   list_insert_ordered (&ready_list, &t->elem, (list_less_func *) &thread_cmp_priority, NULL);
+然后实现一下比较函数thread_cmp_priority：
+
+1 /* priority compare function. */
+2 bool
+3 thread_cmp_priority (const struct list_elem *a, const struct list_elem *b, void *aux UNUSED)
+4 {
+5   return list_entry(a, struct thread, elem)->priority > list_entry(b, struct thread, elem)->priority;
+6 }
+然后对thread_yield和thread_init里的list_push_back作同样的修改：
+
+init_thread:
+
+1   list_insert_ordered (&all_list, &t->allelem, (list_less_func *) &thread_cmp_priority, NULL);
+thread_yield:
+
+1     list_insert_ordered (&ready_list, &cur->elem, (list_less_func *) &thread_cmp_priority, NULL);
+做完这些工作之后， 就兴高采烈地发现alarm_priority这个测试pass了。

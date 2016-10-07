@@ -1,0 +1,7 @@
+1.打开终端
+2.切换到arm-elf-tools-20040427.sh所在目录
+3.增加执行权限
+	sudo chmod 755 arm-elf-tools-20040427.sh
+4. 安装
+	sudo sh arm-elf-tools-20040427.sh
+提示成功即可
